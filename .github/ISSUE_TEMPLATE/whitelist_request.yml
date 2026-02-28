@@ -1,0 +1,25 @@
+name: 申请白名单 (Whitelist Request)
+description: 提交游戏账号以加入白名单
+title: "[申请] 白名单请求"
+labels: ["whitelist"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 👋 欢迎申请 / Welcome
+        **如有其他问题 请点击这里申请加群 此issue仅通过白名单申请
+        [点击这里加入 QQ 群交流](https://qm.qq.com/q/kxLs5JVTBC)**
+        
+        请在下方文本框中输入您的游戏账号。
+        **注意：**
+        1. 仅限输入账号（字母/数字），不要加标点符号。
+        2. 请确保账号已在游戏中注册。
+  
+  - type: input
+    id: username
+    attributes:
+      label: 游戏账号 (Game Username)
+      description: 请直接输入账号，不要带空格或多余的字。
+      placeholder: "例如: xialuoli123"
+    validations:
+      required: true
