@@ -40,6 +40,8 @@ Install with:
 pip install discord.py mysql-connector-python requests
 ```
 
+> **Note:** `mysql-connector-python` is used for **read-only** lookups (uid resolution, current status, login date). All account state changes go through the game server REST API (`/Account/Ban`).
+
 ---
 
 ## ⚙️ Configuration
@@ -63,16 +65,22 @@ On first run the bot creates a `config.json` in the working directory:
     },
     "admin": {
         "default_admin_id": 999999999999999999
+    },
+    "game_api": {
+        "base_url": "http://localhost:5000",
+        "adminkey": "YOUR_ADMIN_KEY_HERE"
     }
 }
 ```
 
 | Field | Description |
 |---|---|
-| `mysql.*` | Credentials for the game's MySQL database |
+| `mysql.*` | Credentials for the game's MySQL database (read-only) |
 | `discord.token` | Your Discord bot token |
 | `github.token` | GitHub personal access token with `repo` scope |
 | `admin.default_admin_id` | Discord user ID automatically granted admin on first boot |
+| `game_api.base_url` | Base URL of the game server API (e.g. `http://192.168.1.10:5000`) |
+| `game_api.adminkey` | Admin key accepted by `/Account/Ban` endpoint |
 
 ---
 
@@ -94,11 +102,15 @@ CREATE TABLE `account` (
 
 ### Block field values
 
-| Value | Meaning | Discord display |
+The `Block` column in MySQL mirrors the `isban` parameter of the game server API:
+
+| Block / isban | Meaning | Discord display |
 |---|---|---|
-| `0` | Whitelisted | ✅ Normal (Whitelisted) |
-| `1` | Not Whitelisted | ⚠️ Not Whitelisted |
-| `2` | Banned | 🚫 Banned |
+| `0` | Whitelisted (`isban=0`) | ✅ Whitelisted |
+| `1` | Banned (`isban=1`) | 🚫 Banned |
+
+> All writes to this field are made exclusively through `GET /Account/Ban?uid=...&isban=...&adminkey=...`.  
+> The bot never issues `UPDATE` statements to MySQL directly.
 
 Admin permissions are stored separately in `admin.db` (SQLite, created automatically at startup).
 
@@ -127,12 +139,22 @@ The bot performs a MySQL connectivity check before starting. If the connection f
 
 ## 📖 Command Reference
 
+### Architecture: API over direct DB
+
+All account state changes (whitelist / ban) are sent to the game server as:
+
+```
+GET /Account/Ban?uid={uid}&isban={0|1}&adminkey={adminkey}
+```
+
+MySQL is used **read-only** — to resolve usernames to UIDs, read current `Block` status, and fetch login dates.  This means the game server remains the single source of truth for account state.
+
 ### Permission model
 
 | Who | Can do |
 |---|---|
-| **Regular member** (has any non-`@everyone`, non-`null` role) | `/white` — self-whitelist when Block is `1` only |
-| **Admin** (listed in `admin.db`) | All commands; can set Block to any value from any state |
+| **Regular member** (has any non-`@everyone`, non-`null` role) | `/white` — self-whitelist via `isban=0` when currently `Block=1` |
+| **Admin** (listed in `admin.db`) | All commands; can call `isban=0` or `isban=1` from any current state |
 
 ---
 
@@ -153,15 +175,14 @@ Whitelist an account. Available to any member who holds at least one real server
 
 ### `/query <uid\|username>` *(Admin)*
 
-Display full account information.
+Display full account information. Status is read from MySQL `Block` which mirrors `isban`.
 
 ```
 🔍 Account Query
 ━━━━━━━━━━━━━━
 👤 Account: username
 🆔 UID: uid
-🏳️ Whitelist Status: ✅ Normal (Whitelisted)
-🔨 Banned Status: ✅ Not Banned
+🏳️ Status: ✅ Whitelisted
 🕒 Last Login: 2026-03-01 02:43:11
 ```
 
@@ -169,27 +190,15 @@ Display full account information.
 
 ### `/adduser <uid\|username>` *(Admin)*
 
-Whitelist an account. Unlike `/white`, this bypasses the ban restriction — admins can whitelist any account regardless of current Block value.
+Whitelist an account — calls `GET /Account/Ban?isban=0`. Unlike `/white`, this bypasses all restrictions; admins can whitelist from any current `Block` state.
 
 ---
 
-### `/setblock <uid\|username> <0|1|2>` *(Admin)*
-
-Freely set an account's Block value to any of the three states. This is the primary tool for fine-grained status control.
-
-```
-🔧 Block status updated
-User: username
-UID: uid
-Previous Status: ⚠️ Not Whitelisted
-New Status: 🚫 Banned
-```
-
----
+### `/ban---
 
 ### `/ban <uid\|username> [reason]` *(Admin)*
 
-Ban an account — sets `Block = 2`. Returns an error if the account is already banned.
+Ban an account — calls `GET /Account/Ban?isban=1`. Returns an error if the account is already banned (`Block=1`).
 
 ```
 🚫 Account banned
@@ -203,7 +212,7 @@ Current Status: 🚫 Banned
 
 ### `/unban <uid\|username>` *(Admin)*
 
-Unban (or restore) an account — sets `Block = 0` from any non-whitelisted state. Returns an error if the account is already whitelisted.
+Unban an account — calls `GET /Account/Ban?isban=0`. Returns an error if the account is already whitelisted (`Block=0`).
 
 ```
 ✅ Account unbanned
@@ -222,7 +231,7 @@ List the first 20 accounts with `Block = 0`, ordered by most recent login.
 
 ### `/banned` *(Admin)*
 
-List the first 20 accounts with `Block = 2`, ordered by most recent login.
+List the first 20 accounts with `Block = 1` (isban=1), ordered by most recent login.
 
 ---
 
@@ -287,7 +296,7 @@ Place `whitelist_request.yml` in `.github/ISSUE_TEMPLATE/` in your game's GitHub
 - **`admin.db` is local only** — it is never read or written by the game server and does not travel through MySQL.
 - The bot does **not** store passwords and never reads the `Password` column.
 - All SQL values are passed as parameterised queries — there is no SQL injection surface.
-- The `/white` command explicitly prevents regular users from clearing a ban (`Block 2 → 0`), so banned players cannot self-reinstate.
+- The `/white` command calls `isban=0` only when `Block == 1`. Accounts that are already whitelisted (`Block=0`) cannot be re-submitted, preventing race conditions. Any account state change is validated against current MySQL state before the API call is made.
 
 ---
 

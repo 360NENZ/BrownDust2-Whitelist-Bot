@@ -39,7 +39,11 @@ def load_config():
         },
         "discord": {"token": "YOUR_DISCORD_BOT_TOKEN_HERE"},
         "github":  {"token": "YOUR_GITHUB_TOKEN_HERE"},
-        "admin":   {"default_admin_id": 999999999999999999}
+        "admin":   {"default_admin_id": 999999999999999999},
+        "game_api": {
+            "base_url": "http://localhost:5000",
+            "adminkey": "YOUR_ADMIN_KEY_HERE"
+        }
     }
     try:
         with open(config_file, 'w') as f:
@@ -65,19 +69,23 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='', intents=intents, help_command=None)
 
-DB_CONFIG = CONFIG['mysql']
-ADMIN_DB  = 'admin.db'
+DB_CONFIG  = CONFIG['mysql']
+ADMIN_DB   = 'admin.db'
+API_CONFIG = CONFIG['game_api']   # base_url + adminkey for /Account/Ban
 
 # ─────────────────────────────────────────────
-# Block field semantics
-#   0 → Whitelisted       ✅ Normal (Whitelisted)
-#   1 → Not Whitelisted   ⚠️ Not Whitelisted
-#   2 → Banned            🚫 Banned
+# Block / isban field semantics
+#
+# The game server controls account state through:
+#   GET /Account/Ban?uid={uid}&isban={0|1}&adminkey={key}
+#
+# The resulting MySQL Block value mirrors isban:
+#   isban=0  →  Block=0  →  ✅ Whitelisted
+#   isban=1  →  Block=1  →  🚫 Banned
 # ─────────────────────────────────────────────
 BLOCK_LABELS = {
-    0: "✅ Normal (Whitelisted)",
-    1: "⚠️ Not Whitelisted",
-    2: "🚫 Banned",
+    0: "✅ Whitelisted",
+    1: "🚫 Banned",
 }
 
 def fmt_block(block: int) -> str:
@@ -182,26 +190,32 @@ def remove_admin(user_id: int):
             con.close()
 
 # ─────────────────────────────────────────────
-# MySQL connectivity check
+# MySQL connectivity check  (reads only — all
+# writes go through the game API)
 # ─────────────────────────────────────────────
 def init_db():
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         if conn.is_connected():
-            logger.info("MySQL connection verified.")
+            logger.info("MySQL connection verified (read-only).")
         conn.close()
     except Error as e:
         logger.error(f"MySQL error: {e}")
         return str(e)
     return None
 
+
 # ─────────────────────────────────────────────
-# Core DB helpers  — account table
+# MySQL read helpers  — account table (read-only)
+#
+# The game server owns all writes; we only read
+# current state, uid lookups, and login dates.
 # ─────────────────────────────────────────────
 def _get_account(cursor, identifier: str):
     """
     Returns (Uid, UserName, Block, LoginDate) or None.
     Accepts numeric Uid or UserName string.
+    Block mirrors isban: 0=Whitelisted  1=Banned.
     """
     col, val = resolve_identifier(identifier)
     cursor.execute(
@@ -212,133 +226,23 @@ def _get_account(cursor, identifier: str):
     return cursor.fetchone()
 
 
-def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
+def _read_account(identifier: str):
     """
-    Set Block = 0.
-    Returns (success, uid, username, error_msg).
-
-    Permission rules enforced here:
-      admin=True  — can whitelist from any Block state (0 / 1 / 2).
-      admin=False — can only whitelist when Block == 1 (Not Whitelisted).
-                    Block == 0 → already whitelisted (error).
-                    Block == 2 → banned; only an admin can clear this.
+    Open a short-lived MySQL connection, read one account row, close.
+    Returns (uid, username, block, login_date, error_msg).
     """
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cur  = conn.cursor()
         row  = _get_account(cur, identifier)
         if not row:
-            return False, None, None, f"Account [{identifier}] does not exist!"
-        uid, username, block, _ = row
-        if block == 0:
-            return False, uid, username, f"User **{username}** ({uid}) is already whitelisted."
-        if not admin and block == 2:
-            return False, uid, username, (
-                f"Account **{username}** ({uid}) is banned. "
-                f"Only an administrator can remove this restriction."
-            )
-        cur.execute("UPDATE `account` SET `Block` = 0 WHERE `Uid` = %s", (uid,))
-        conn.commit()
-        logger.info(f"Whitelisted '{username}' (Uid {uid}) by {added_by} [admin={admin}]")
-        return True, uid, username, None
+            return None, None, None, None, f"Account [{identifier}] does not exist!"
+        uid, username, block, login_date = row
+        return uid, username, block, login_date, None
     except Error as e:
-        return False, None, None, f"Database error: {e}"
+        return None, None, None, None, f"Database error: {e}"
     except Exception as e:
-        return False, None, None, f"Unexpected error: {e}"
-    finally:
-        if 'conn' in locals() and conn.is_connected():
-            cur.close(); conn.close()
-
-
-def ban_user(identifier: str, banned_by: str, reason: str):
-    """
-    Set Block = 2.
-    Returns (success, uid, username, old_block, error_msg).
-    Duplicate detection: error when Block is already 2.
-    """
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur  = conn.cursor()
-        row  = _get_account(cur, identifier)
-        if not row:
-            return False, None, None, None, f"Account [{identifier}] does not exist!"
-        uid, username, block, _ = row
-        if block == 2:
-            return False, uid, username, block, f"User **{username}** ({uid}) is already banned."
-        cur.execute("UPDATE `account` SET `Block` = 2 WHERE `Uid` = %s", (uid,))
-        conn.commit()
-        logger.info(f"Banned '{username}' (Uid {uid}) by {banned_by}. Reason: {reason}")
-        return True, uid, username, block, None
-    except Error as e:
-        return False, None, None, None, f"Database error: {e}"
-    except Exception as e:
-        return False, None, None, None, f"Unexpected error: {e}"
-    finally:
-        if 'conn' in locals() and conn.is_connected():
-            cur.close(); conn.close()
-
-
-def unban_user(identifier: str):
-    """
-    Set Block = 0 (admin action — removes any restriction).
-    Returns (success, uid, username, error_msg).
-    Duplicate detection: error when Block is already 0.
-    Admins can unban from Block=1 or Block=2 — both are non-whitelisted states.
-    """
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur  = conn.cursor()
-        row  = _get_account(cur, identifier)
-        if not row:
-            return False, None, None, f"Account [{identifier}] does not exist!"
-        uid, username, block, _ = row
-        if block == 0:
-            return False, uid, username, (
-                f"User **{username}** ({uid}) is already whitelisted "
-                f"(current status: {fmt_block(block)})."
-            )
-        cur.execute("UPDATE `account` SET `Block` = 0 WHERE `Uid` = %s", (uid,))
-        conn.commit()
-        logger.info(f"Unbanned '{username}' (Uid {uid}), was Block={block}")
-        return True, uid, username, None
-    except Error as e:
-        return False, None, None, f"Database error: {e}"
-    except Exception as e:
-        return False, None, None, f"Unexpected error: {e}"
-    finally:
-        if 'conn' in locals() and conn.is_connected():
-            cur.close(); conn.close()
-
-
-def set_block(identifier: str, new_block: int, set_by: str):
-    """
-    Admin-only: set Block to an arbitrary value (0, 1, or 2).
-    Returns (success, uid, username, old_block, error_msg).
-    Duplicate detection: error when Block is already the requested value.
-    """
-    if new_block not in (0, 1, 2):
-        return False, None, None, None, f"Invalid Block value '{new_block}'. Must be 0, 1, or 2."
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur  = conn.cursor()
-        row  = _get_account(cur, identifier)
-        if not row:
-            return False, None, None, None, f"Account [{identifier}] does not exist!"
-        uid, username, block, _ = row
-        if block == new_block:
-            return False, uid, username, block, (
-                f"User **{username}** ({uid}) already has status {fmt_block(new_block)}."
-            )
-        cur.execute("UPDATE `account` SET `Block` = %s WHERE `Uid` = %s", (new_block, uid))
-        conn.commit()
-        logger.info(
-            f"Block set {block}→{new_block} for '{username}' (Uid {uid}) by {set_by}"
-        )
-        return True, uid, username, block, None
-    except Error as e:
-        return False, None, None, None, f"Database error: {e}"
-    except Exception as e:
-        return False, None, None, None, f"Unexpected error: {e}"
+        return None, None, None, None, f"Unexpected error: {e}"
     finally:
         if 'conn' in locals() and conn.is_connected():
             cur.close(); conn.close()
@@ -349,26 +253,128 @@ def query_account(identifier: str):
     Returns (account_dict, error_msg).
     account_dict keys: uid, username, block, login_date
     """
+    uid, username, block, login_date, err = _read_account(identifier)
+    if err:
+        return None, err
+    return {"uid": uid, "username": username, "block": block, "login_date": login_date}, None
+
+
+# ─────────────────────────────────────────────
+# Game API layer  — GET /Account/Ban
+#
+# This is the ONLY write surface for account state.
+# Direct MySQL writes are never performed.
+#
+#   GET /Account/Ban?uid={uid}&isban={0|1}&adminkey={key}
+#
+#   isban=0  →  unblock / whitelist
+#   isban=1  →  block   / ban
+# ─────────────────────────────────────────────
+async def _api_set_ban(uid: int, isban: int) -> tuple[bool, str | None]:
+    """
+    Call the game server's /Account/Ban endpoint.
+    Returns (success, error_msg).
+    """
+    if isban not in (0, 1):
+        return False, f"Invalid isban value '{isban}'. Must be 0 or 1."
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur  = conn.cursor()
-        row  = _get_account(cur, identifier)
-        if not row:
-            return None, f"Account [{identifier}] does not exist!"
-        uid, username, block, login_date = row
-        return {
-            "uid": uid,
-            "username": username,
-            "block": block,
-            "login_date": login_date
-        }, None
-    except Error as e:
-        return None, f"Database error: {e}"
+        base   = API_CONFIG['base_url'].rstrip('/')
+        url    = f"{base}/Account/Ban"
+        params = {
+            'uid':      str(uid),
+            'isban':    isban,
+            'adminkey': API_CONFIG['adminkey'],
+        }
+        resp = await asyncio.to_thread(
+            requests.get, url, params=params, timeout=10
+        )
+        if resp.status_code == 200:
+            logger.info(f"API /Account/Ban uid={uid} isban={isban} → 200 OK")
+            return True, None
+        else:
+            msg = f"API error {resp.status_code}: {resp.text[:200]}"
+            logger.error(f"API /Account/Ban uid={uid} isban={isban} → {msg}")
+            return False, msg
+    except requests.exceptions.Timeout:
+        return False, "Game API request timed out."
+    except requests.exceptions.RequestException as e:
+        return False, f"Game API network error: {e}"
     except Exception as e:
-        return None, f"Unexpected error: {e}"
-    finally:
-        if 'conn' in locals() and conn.is_connected():
-            cur.close(); conn.close()
+        return False, f"Unexpected API error: {e}"
+
+
+# ─────────────────────────────────────────────
+# High-level account operations
+# All state changes go through _api_set_ban().
+# MySQL is used only to read current state / uid.
+# ─────────────────────────────────────────────
+
+async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
+    """
+    Whitelist an account → API isban=0.
+    Returns (success, uid, username, error_msg).
+
+    admin=False (/white — regular member):
+      • Allowed only when Block == 1 (currently banned/inactive).
+      • Block == 0 already → duplicate error.
+    admin=True  (/adduser, GitHub pipelines):
+      • Allowed from any Block state.
+    """
+    uid, username, block, _, err = _read_account(identifier)
+    if err:
+        return False, None, None, err
+    if block == 0:
+        return False, uid, username, f"User **{username}** ({uid}) is already whitelisted."
+    if not admin and block != 1:
+        return False, uid, username, (
+            f"Account **{username}** ({uid}) cannot be self-whitelisted. "
+            f"Please contact an administrator."
+        )
+    ok, api_err = await _api_set_ban(uid, isban=0)
+    if not ok:
+        return False, uid, username, api_err
+    logger.info(f"Whitelisted '{username}' (Uid {uid}) by {added_by} [admin={admin}]")
+    return True, uid, username, None
+
+
+async def ban_user(identifier: str, banned_by: str, reason: str):
+    """
+    Ban an account → API isban=1.
+    Returns (success, uid, username, old_block, error_msg).
+    Duplicate detection: error when Block is already 1.
+    """
+    uid, username, block, _, err = _read_account(identifier)
+    if err:
+        return False, None, None, None, err
+    if block == 1:
+        return False, uid, username, block, f"User **{username}** ({uid}) is already banned."
+    ok, api_err = await _api_set_ban(uid, isban=1)
+    if not ok:
+        return False, uid, username, block, api_err
+    logger.info(f"Banned '{username}' (Uid {uid}) by {banned_by}. Reason: {reason}")
+    return True, uid, username, block, None
+
+
+async def unban_user(identifier: str):
+    """
+    Unban an account → API isban=0.
+    Returns (success, uid, username, error_msg).
+    Duplicate detection: error when Block is already 0.
+    """
+    uid, username, block, _, err = _read_account(identifier)
+    if err:
+        return False, None, None, err
+    if block == 0:
+        return False, uid, username, (
+            f"User **{username}** ({uid}) is already whitelisted "
+            f"(current status: {fmt_block(block)})."
+        )
+    ok, api_err = await _api_set_ban(uid, isban=0)
+    if not ok:
+        return False, uid, username, api_err
+    logger.info(f"Unbanned '{username}' (Uid {uid}), was Block={block}")
+    return True, uid, username, None
+
 
 # ─────────────────────────────────────────────
 # GitHub helpers
@@ -465,22 +471,22 @@ async def help(interaction: discord.Interaction):
 **Discord Bot Commands**
 
 **General (any member with a role):**
-- `/white <uid|username>` — Whitelist your account (Block 1 → 0 only; banned accounts must contact an admin)
+- `/white <uid|username>` — Whitelist your account (only when currently Banned; contact admin if needed)
 
 **Admin only:**
 - `/query <uid|username>` — Look up full account information
-- `/adduser <uid|username>` — Whitelist an account (bypasses ban; Block any → 0)
-- `/setblock <uid|username> <0|1|2>` — Freely set any Block value
-- `/ban <uid|username> [reason]` — Ban an account (Block → 2)
-- `/unban <uid|username>` — Unban an account (Block any → 0)
+- `/adduser <uid|username>` — Whitelist an account (isban=0, bypasses all restrictions)
+- `/ban <uid|username> [reason]` — Ban an account (isban=1)
+- `/unban <uid|username>` — Unban an account (isban=0)
 - `/whitelisted` — List all whitelisted accounts (Block=0)
-- `/banned` — List all banned accounts (Block=2)
+- `/banned` — List all banned accounts (Block=1)
 - `/processissue <owner> <repo> <number>` — Process one GitHub whitelist issue
 - `/batchprocess <owner> <repo>` — Batch-process all open whitelist issues
 - `/setadmin <user>` — Grant admin privileges to a Discord user
 - `/removeadmin <user>` — Revoke admin privileges from a Discord user
 
-**Block values:** `0` = ✅ Normal (Whitelisted) · `1` = ⚠️ Not Whitelisted · `2` = 🚫 Banned
+**Account state** is controlled via the game server API (`/Account/Ban`):
+`isban=0` = ✅ Whitelisted  ·  `isban=1` = 🚫 Banned
 **Uid or UserName:** all account commands accept either format.
 **Admin list** is stored in `admin.db` (local SQLite, independent of MySQL).
 """
@@ -499,7 +505,7 @@ async def white(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = add_to_whitelist(identifier, str(interaction.user), admin=False)
+    success, uid, username, error_msg = await add_to_whitelist(identifier, str(interaction.user), admin=False)
     if success:
         await interaction.response.send_message(
             f"✅ User **{username}**({uid}) added to whitelist!"
@@ -525,18 +531,15 @@ async def query(interaction: discord.Interaction, identifier: str):
         return
 
     block = account['block']
-    # Whitelist status: only "whitelisted" when Block=0
-    whitelist_st = "✅ Normal (Whitelisted)" if block == 0 else "⚠️ Not Whitelisted"
-    # Ban status: only "banned" when Block=2
-    ban_st       = "🚫 Banned"     if block == 2 else "✅ Not Banned"
+    # isban semantics: Block=0 → Whitelisted (isban=0), Block=1 → Banned (isban=1)
+    status_st = fmt_block(block)
 
     msg = (
         f"🔍 **Account Query**\n"
         f"━━━━━━━━━━━━━━\n"
         f"👤 Account: `{account['username']}`\n"
         f"🆔 UID: `{account['uid']}`\n"
-        f"🏳️ Whitelist Status: {whitelist_st}\n"
-        f"🔨 Banned Status: {ban_st}\n"
+        f"🏳️ Status: {status_st}\n"
         f"🕒 Last Login: `{account['login_date']}`"
     )
     await interaction.response.send_message(msg)
@@ -552,7 +555,7 @@ async def adduser(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = add_to_whitelist(identifier, str(interaction.user), admin=True)
+    success, uid, username, error_msg = await add_to_whitelist(identifier, str(interaction.user), admin=True)
     if success:
         await interaction.response.send_message(
             f"✅ User **{username}**({uid}) added to whitelist!"
@@ -576,7 +579,7 @@ async def ban(
         )
         return
 
-    success, uid, username, old_block, error_msg = ban_user(
+    success, uid, username, old_block, error_msg = await ban_user(
         identifier, str(interaction.user), reason
     )
     if success:
@@ -603,7 +606,7 @@ async def unban(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = unban_user(identifier)
+    success, uid, username, error_msg = await unban_user(identifier)
     if success:
         msg = (
             f"✅ **Account unbanned**\n"
@@ -668,13 +671,13 @@ async def banned(interaction: discord.Interaction):
         cur  = conn.cursor()
         cur.execute(
             "SELECT `Uid`, `UserName`, `LoginDate` FROM `account` "
-            "WHERE `Block` = 2 ORDER BY `LoginDate` DESC"
+            "WHERE `Block` = 1 ORDER BY `LoginDate` DESC"
         )
         rows = cur.fetchall()
         if not rows:
             await interaction.response.send_message("📋 No banned accounts found.")
             return
-        lines = [f"📋 Banned Accounts ({len(rows)} total):"]
+        lines = [f"📋 Banned Accounts — isban=1 ({len(rows)} total):"]
         for uid, uname, ldate in rows[:20]:
             lines.append(f"- `{uname}` (Uid: {uid}, Last Login: {ldate})")
         if len(rows) > 20:
@@ -732,7 +735,7 @@ async def processissue(
 
         added, skipped, skip_reasons = 0, 0, []
         for uname in usernames:
-            success, uid, username, err = add_to_whitelist(uname, f"GitHub Issue #{issue_number}", admin=True)
+            success, uid, username, err = await add_to_whitelist(uname, f"GitHub Issue #{issue_number}", admin=True)
             if success:
                 added += 1
             else:
@@ -811,7 +814,7 @@ async def batchprocess(interaction: discord.Interaction, repo_owner: str, repo_n
 
         added, skipped = 0, 0
         for uname in set(all_usernames):
-            success, *_ = add_to_whitelist(uname, "Batch Process", admin=True)
+            success, *_ = await add_to_whitelist(uname, "Batch Process", admin=True)
             if success:
                 added += 1
             else:
@@ -834,39 +837,6 @@ async def batchprocess(interaction: discord.Interaction, repo_owner: str, repo_n
     except Exception as e:
         await interaction.followup.send(f"❌ Unexpected error: {e}")
         logger.error(f"/batchprocess unexpected error: {e}")
-
-
-# ── /setblock ────────────────────────────────
-@app_commands.command(name="setblock", description="Freely set an account's Block status (Admin only)")
-@app_commands.describe(
-    identifier="Game Uid (numeric) or UserName",
-    block_value="0 = Whitelisted · 1 = Not Whitelisted · 2 = Banned"
-)
-async def setblock(interaction: discord.Interaction, identifier: str, block_value: int):
-    if not is_admin(interaction.user.id):
-        await interaction.response.send_message(
-            "❌ You don't have permission to use this command.", ephemeral=True
-        )
-        return
-
-    success, uid, username, old_block, error_msg = set_block(
-        identifier, block_value, str(interaction.user)
-    )
-    if success:
-        msg = (
-            f"🔧 **Block status updated**\n"
-            f"User: `{username}`\n"
-            f"UID: `{uid}`\n"
-            f"Previous Status: {fmt_block(old_block)}\n"
-            f"New Status: {fmt_block(block_value)}"
-        )
-        await interaction.response.send_message(msg)
-        logger.info(
-            f"/setblock: '{username}' (Uid {uid}) "
-            f"Block {old_block}→{block_value} by {interaction.user}"
-        )
-    else:
-        await interaction.response.send_message(f"❌ {error_msg}")
 
 
 # ── /setadmin ────────────────────────────────
@@ -920,7 +890,7 @@ async def removeadmin(interaction: discord.Interaction, user: discord.User):
 # ─────────────────────────────────────────────
 async def register_commands():
     for cmd in (
-        help, white, query, adduser, setblock, ban, unban,
+        help, white, query, adduser, ban, unban,
         whitelisted, banned,
         processissue, batchprocess,
         setadmin, removeadmin,
@@ -940,11 +910,24 @@ async def on_ready():
             status=discord.Status.dnd,
             activity=discord.Game(name="Database Error")
         )
-    else:
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=discord.Game(name="Ready")
+        return
+
+    # Verify game API reachability (non-fatal — bot still starts)
+    try:
+        base = API_CONFIG['base_url'].rstrip('/')
+        probe = await asyncio.to_thread(
+            requests.get, f"{base}/Account/Ban",
+            params={'uid': '0', 'isban': '0', 'adminkey': API_CONFIG['adminkey']},
+            timeout=5
         )
+        logger.info(f"Game API probe → HTTP {probe.status_code}")
+    except Exception as e:
+        logger.warning(f"Game API unreachable at startup: {e}")
+
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Game(name="Ready")
+    )
 
     await register_commands()
     try:
