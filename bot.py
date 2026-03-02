@@ -267,46 +267,138 @@ def query_account(identifier: str):
 #
 #   GET /Account/Ban?uid={uid}&isban={0|1}&adminkey={key}
 #
-#   isban=0  →  unblock / whitelist
-#   isban=1  →  block   / ban
+#   isban=0  →  unblock / whitelist    (msg: "解封成功")
+#   isban=1  →  block   / ban          (msg: "封禁成功")
+#
+# The server may return two distinct JSON shapes:
+#
+#   App-level:   {"code": 200|400|403|404|500, "msg": "...",
+#                 "uid": 1, "userName": "...", "isBan": 0|1}
+#
+#   ASP.NET model-validation:
+#                {"status": 400, "title": "...",
+#                 "errors": {"field": ["msg"]}, "traceId": "..."}
 # ─────────────────────────────────────────────
-async def _api_set_ban(uid: int, isban: int) -> tuple[bool, str | None]:
+
+def _parse_api_error(data: dict, http_status: int) -> str:
     """
-    Call the game server's /Account/Ban endpoint.
-    Returns (success, error_msg).
+    Translate a non-200 API response dict into a human-readable English string.
+    Handles both app-level and ASP.NET model-validation shapes.
+    """
+    # ── ASP.NET model-validation shape ─────────────────
+    # Identified by "traceId" + "errors" keys (no "code" key)
+    if "traceId" in data and "errors" in data:
+        missing = ", ".join(f"`{k}`" for k in data["errors"])
+        return (
+            f"Game API validation error — missing required parameter(s): {missing}. "
+            f"Check `game_api.adminkey` and `game_api.base_url` in config.json."
+        )
+
+    # ── App-level shape ─────────────────────────────────
+    code = data.get("code", http_status)
+    msg  = data.get("msg", "")
+
+    if code == 404:
+        # "用户不存在" — account doesn't exist on the game server
+        return (
+            "Account not found on the game server. "
+            "The uid may be incorrect or the account was deleted."
+        )
+    if code == 403:
+        # "adminkey无效" — wrong key
+        return (
+            "Admin key rejected by the game server. "
+            "Check `game_api.adminkey` in config.json."
+        )
+    if code == 500:
+        # "管理员密钥未配置" — server-side key not set
+        return (
+            "Game server error: admin key is not configured server-side. "
+            f"Server message: {msg}"
+        )
+    if code == 400:
+        # "isban参数错误" / "uid不能为空"
+        return f"Bad request to game API: {msg}"
+
+    return f"Unexpected API response (code={code}): {msg}"
+
+
+async def _api_set_ban(uid: int, isban: int):
+    """
+    Call GET /Account/Ban and fully parse the response body.
+
+    Returns a 5-tuple:
+        (success, api_uid, api_username, api_isban, error_msg)
+
+    On success (code=200):
+        api_uid      — confirmed uid   from the server response
+        api_username — confirmed name  from the server response
+        api_isban    — confirmed state from the server response (0 or 1)
+        error_msg    — None
+
+    On failure:
+        api_uid / api_username / api_isban — None
+        error_msg — human-readable English explanation
     """
     if isban not in (0, 1):
-        return False, f"Invalid isban value '{isban}'. Must be 0 or 1."
+        return False, None, None, None, f"Invalid isban value '{isban}'. Must be 0 or 1."
+
     try:
-        base   = API_CONFIG['base_url'].rstrip('/')
+        base   = API_CONFIG["base_url"].rstrip("/")
         url    = f"{base}/Account/Ban"
         params = {
-            'uid':      str(uid),
-            'isban':    isban,
-            'adminkey': API_CONFIG['adminkey'],
+            "uid":      str(uid),
+            "isban":    isban,
+            "adminkey": API_CONFIG["adminkey"],
         }
-        resp = await asyncio.to_thread(
-            requests.get, url, params=params, timeout=10
+        resp = await asyncio.to_thread(requests.get, url, params=params, timeout=10)
+
+        # ── Decode body ─────────────────────────────────
+        try:
+            data = resp.json()
+        except ValueError:
+            return False, None, None, None, (
+                f"Game API returned a non-JSON response "
+                f"(HTTP {resp.status_code}): {resp.text[:120]}"
+            )
+
+        # ── Success ─────────────────────────────────────
+        if data.get("code") == 200:
+            api_uid      = data.get("uid")
+            api_username = data.get("userName")
+            api_isban    = data.get("isBan")
+            logger.info(
+                f"API /Account/Ban uid={uid} isban={isban} → 200  "
+                f"userName={api_username!r} isBan={api_isban}"
+            )
+            return True, api_uid, api_username, api_isban, None
+
+        # ── Failure ─────────────────────────────────────
+        err_msg = _parse_api_error(data, resp.status_code)
+        logger.error(
+            f"API /Account/Ban uid={uid} isban={isban} → "
+            f"HTTP {resp.status_code}  body={data}"
         )
-        if resp.status_code == 200:
-            logger.info(f"API /Account/Ban uid={uid} isban={isban} → 200 OK")
-            return True, None
-        else:
-            msg = f"API error {resp.status_code}: {resp.text[:200]}"
-            logger.error(f"API /Account/Ban uid={uid} isban={isban} → {msg}")
-            return False, msg
+        return False, None, None, None, err_msg
+
     except requests.exceptions.Timeout:
-        return False, "Game API request timed out."
+        return False, None, None, None, "Game API request timed out (10 s)."
+    except requests.exceptions.ConnectionError:
+        return False, None, None, None, (
+            f"Cannot connect to game API at {API_CONFIG['base_url']}. "
+            "Is the game server running?"
+        )
     except requests.exceptions.RequestException as e:
-        return False, f"Game API network error: {e}"
+        return False, None, None, None, f"Game API network error: {e}"
     except Exception as e:
-        return False, f"Unexpected API error: {e}"
+        return False, None, None, None, f"Unexpected error calling game API: {e}"
 
 
 # ─────────────────────────────────────────────
 # High-level account operations
 # All state changes go through _api_set_ban().
-# MySQL is used only to read current state / uid.
+# MySQL is used read-only (uid resolution +
+# current-state duplicate detection).
 # ─────────────────────────────────────────────
 
 async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
@@ -315,10 +407,13 @@ async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
     Returns (success, uid, username, error_msg).
 
     admin=False (/white — regular member):
-      • Allowed only when Block == 1 (currently banned/inactive).
+      • Allowed only when Block == 1 (banned/inactive).
       • Block == 0 already → duplicate error.
     admin=True  (/adduser, GitHub pipelines):
       • Allowed from any Block state.
+
+    Output uid/username are taken from the API response (server-confirmed)
+    and fall back to the MySQL pre-read values if the API omits them.
     """
     uid, username, block, _, err = _read_account(identifier)
     if err:
@@ -330,11 +425,13 @@ async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
             f"Account **{username}** ({uid}) cannot be self-whitelisted. "
             f"Please contact an administrator."
         )
-    ok, api_err = await _api_set_ban(uid, isban=0)
+    ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=0)
     if not ok:
         return False, uid, username, api_err
-    logger.info(f"Whitelisted '{username}' (Uid {uid}) by {added_by} [admin={admin}]")
-    return True, uid, username, None
+    out_uid      = api_uid      if api_uid      is not None else uid
+    out_username = api_username if api_username is not None else username
+    logger.info(f"Whitelisted '{out_username}' (Uid {out_uid}) by {added_by} [admin={admin}]")
+    return True, out_uid, out_username, None
 
 
 async def ban_user(identifier: str, banned_by: str, reason: str):
@@ -348,11 +445,13 @@ async def ban_user(identifier: str, banned_by: str, reason: str):
         return False, None, None, None, err
     if block == 1:
         return False, uid, username, block, f"User **{username}** ({uid}) is already banned."
-    ok, api_err = await _api_set_ban(uid, isban=1)
+    ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=1)
     if not ok:
         return False, uid, username, block, api_err
-    logger.info(f"Banned '{username}' (Uid {uid}) by {banned_by}. Reason: {reason}")
-    return True, uid, username, block, None
+    out_uid      = api_uid      if api_uid      is not None else uid
+    out_username = api_username if api_username is not None else username
+    logger.info(f"Banned '{out_username}' (Uid {out_uid}) by {banned_by}. Reason: {reason}")
+    return True, out_uid, out_username, block, None
 
 
 async def unban_user(identifier: str):
@@ -369,11 +468,13 @@ async def unban_user(identifier: str):
             f"User **{username}** ({uid}) is already whitelisted "
             f"(current status: {fmt_block(block)})."
         )
-    ok, api_err = await _api_set_ban(uid, isban=0)
+    ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=0)
     if not ok:
         return False, uid, username, api_err
-    logger.info(f"Unbanned '{username}' (Uid {uid}), was Block={block}")
-    return True, uid, username, None
+    out_uid      = api_uid      if api_uid      is not None else uid
+    out_username = api_username if api_username is not None else username
+    logger.info(f"Unbanned '{out_username}' (Uid {out_uid}), was Block={block}")
+    return True, out_uid, out_username, None
 
 
 # ─────────────────────────────────────────────
@@ -497,7 +598,7 @@ async def help(interaction: discord.Interaction):
 @app_commands.command(name="white", description="Add an account to the whitelist")
 @app_commands.describe(identifier="Game Uid (numeric) or UserName")
 async def white(interaction: discord.Interaction, identifier: str):
-    # Available to any member who has at least one real role
+    # Permission check is synchronous — must run before defer() so ephemeral still works
     member = interaction.user
     if not isinstance(member, discord.Member) or not has_real_role(member):
         await interaction.response.send_message(
@@ -505,14 +606,21 @@ async def white(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = await add_to_whitelist(identifier, str(interaction.user), admin=False)
-    if success:
-        await interaction.response.send_message(
-            f"✅ User **{username}**({uid}) added to whitelist!"
+    # Defer immediately — MySQL read + API call will exceed Discord's 3-second window
+    await interaction.response.defer()
+
+    try:
+        success, uid, username, error_msg = await add_to_whitelist(
+            identifier, str(interaction.user), admin=False
         )
-        logger.info(f"/white: '{username}' (Uid {uid}) whitelisted by {interaction.user}")
-    else:
-        await interaction.response.send_message(f"❌ {error_msg}")
+        if success:
+            await interaction.followup.send(f"✅ User **{username}**({uid}) added to whitelist!")
+            logger.info(f"/white: '{username}' (Uid {uid}) whitelisted by {interaction.user}")
+        else:
+            await interaction.followup.send(f"❌ {error_msg}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Unexpected error: {e}")
+        logger.error(f"/white unexpected error: {e}")
 
 
 # ── /query ───────────────────────────────────
@@ -555,18 +663,24 @@ async def adduser(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = await add_to_whitelist(identifier, str(interaction.user), admin=True)
-    if success:
-        await interaction.response.send_message(
-            f"✅ User **{username}**({uid}) added to whitelist!"
+    await interaction.response.defer()
+
+    try:
+        success, uid, username, error_msg = await add_to_whitelist(
+            identifier, str(interaction.user), admin=True
         )
-        logger.info(f"/adduser: '{username}' (Uid {uid}) whitelisted by {interaction.user}")
-    else:
-        await interaction.response.send_message(f"❌ {error_msg}")
+        if success:
+            await interaction.followup.send(f"✅ User **{username}**({uid}) added to whitelist!")
+            logger.info(f"/adduser: '{username}' (Uid {uid}) whitelisted by {interaction.user}")
+        else:
+            await interaction.followup.send(f"❌ {error_msg}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Unexpected error: {e}")
+        logger.error(f"/adduser unexpected error: {e}")
 
 
 # ── /ban ─────────────────────────────────────
-@app_commands.command(name="ban", description="Ban an account (Block → 2) by UserName or Uid")
+@app_commands.command(name="ban", description="Ban an account (isban=1) by UserName or Uid")
 @app_commands.describe(identifier="Game Uid (numeric) or UserName", reason="Reason for ban")
 async def ban(
     interaction: discord.Interaction,
@@ -579,25 +693,31 @@ async def ban(
         )
         return
 
-    success, uid, username, old_block, error_msg = await ban_user(
-        identifier, str(interaction.user), reason
-    )
-    if success:
-        msg = (
-            f"🚫 **Account banned**\n"
-            f"User: `{username}`\n"
-            f"UID: `{uid}`\n"
-            f"Original Status: {fmt_block(old_block)}\n"
-            f"Current Status: {fmt_block(2)}"
+    await interaction.response.defer()
+
+    try:
+        success, uid, username, old_block, error_msg = await ban_user(
+            identifier, str(interaction.user), reason
         )
-        await interaction.response.send_message(msg)
-        logger.info(f"/ban: '{username}' (Uid {uid}) by {interaction.user}. Reason: {reason}")
-    else:
-        await interaction.response.send_message(f"❌ {error_msg}")
+        if success:
+            msg = (
+                f"🚫 **Account banned**\n"
+                f"User: `{username}`\n"
+                f"UID: `{uid}`\n"
+                f"Original Status: {fmt_block(old_block)}\n"
+                f"Current Status: {fmt_block(1)}"
+            )
+            await interaction.followup.send(msg)
+            logger.info(f"/ban: '{username}' (Uid {uid}) by {interaction.user}. Reason: {reason}")
+        else:
+            await interaction.followup.send(f"❌ {error_msg}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Unexpected error: {e}")
+        logger.error(f"/ban unexpected error: {e}")
 
 
 # ── /unban ───────────────────────────────────
-@app_commands.command(name="unban", description="Unban an account (Block → 0) by UserName or Uid")
+@app_commands.command(name="unban", description="Unban an account (isban=0) by UserName or Uid")
 @app_commands.describe(identifier="Game Uid (numeric) or UserName")
 async def unban(interaction: discord.Interaction, identifier: str):
     if not is_admin(interaction.user.id):
@@ -606,18 +726,24 @@ async def unban(interaction: discord.Interaction, identifier: str):
         )
         return
 
-    success, uid, username, error_msg = await unban_user(identifier)
-    if success:
-        msg = (
-            f"✅ **Account unbanned**\n"
-            f"User: `{username}`\n"
-            f"UID: `{uid}`\n"
-            f"Result: ✅ Success"
-        )
-        await interaction.response.send_message(msg)
-        logger.info(f"/unban: '{username}' (Uid {uid}) by {interaction.user}")
-    else:
-        await interaction.response.send_message(f"❌ {error_msg}")
+    await interaction.response.defer()
+
+    try:
+        success, uid, username, error_msg = await unban_user(identifier)
+        if success:
+            msg = (
+                f"✅ **Account unbanned**\n"
+                f"User: `{username}`\n"
+                f"UID: `{uid}`\n"
+                f"Result: ✅ Success"
+            )
+            await interaction.followup.send(msg)
+            logger.info(f"/unban: '{username}' (Uid {uid}) by {interaction.user}")
+        else:
+            await interaction.followup.send(f"❌ {error_msg}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Unexpected error: {e}")
+        logger.error(f"/unban unexpected error: {e}")
 
 
 # ── /whitelisted ─────────────────────────────
@@ -913,6 +1039,8 @@ async def on_ready():
         return
 
     # Verify game API reachability (non-fatal — bot still starts)
+    # A uid=0 probe returns 404 "用户不存在" if the server is up,
+    # which is the expected/healthy response for a non-existent uid.
     try:
         base = API_CONFIG['base_url'].rstrip('/')
         probe = await asyncio.to_thread(
@@ -920,9 +1048,33 @@ async def on_ready():
             params={'uid': '0', 'isban': '0', 'adminkey': API_CONFIG['adminkey']},
             timeout=5
         )
-        logger.info(f"Game API probe → HTTP {probe.status_code}")
+        try:
+            probe_data = probe.json()
+            probe_code = probe_data.get("code", probe.status_code)
+        except ValueError:
+            probe_code = probe.status_code
+
+        if probe_code in (200, 404):
+            # 200 = success  /  404 = uid not found — both mean the server is alive
+            logger.info(f"Game API reachable (probe code={probe_code})")
+        elif probe_code == 403:
+            logger.warning(
+                "Game API reachable but adminkey is INVALID — "
+                "ban/unban commands will fail until config.json is corrected."
+            )
+        elif probe_code == 500:
+            logger.warning(
+                "Game API reachable but admin key is NOT CONFIGURED server-side."
+            )
+        else:
+            logger.warning(f"Game API probe returned unexpected code={probe_code}")
+    except requests.exceptions.ConnectionError:
+        logger.warning(
+            f"Game API unreachable at startup ({API_CONFIG['base_url']}). "
+            "Ban/unban commands will fail until the server is available."
+        )
     except Exception as e:
-        logger.warning(f"Game API unreachable at startup: {e}")
+        logger.warning(f"Game API probe error: {e}")
 
     await bot.change_presence(
         status=discord.Status.online,
