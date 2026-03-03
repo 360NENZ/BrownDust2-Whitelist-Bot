@@ -589,8 +589,23 @@ def extract_username_from_issue(issue_body: str):
     return tokens[0] if tokens else None
 
 
-# Async-safe HTTP wrappers
-# (requests is blocking — offload to thread pool to keep the event loop free)
+# ─────────────────────────────────────────────
+# Async-safe GitHub HTTP helpers
+#
+# Fine-grained PATs require the 'Bearer' scheme.
+# The legacy 'token' scheme works only for classic
+# PATs and silently fails for collaborator access
+# when using fine-grained tokens.
+# ─────────────────────────────────────────────
+def _github_headers(token: str) -> dict:
+    """Build the correct headers for all GitHub REST API calls."""
+    return {
+        'Authorization':        f'Bearer {token}',
+        'Accept':               'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    }
+
+
 async def _http_get(url: str, headers: dict) -> requests.Response:
     return await asyncio.to_thread(requests.get, url, headers=headers)
 
@@ -603,7 +618,7 @@ async def _http_patch(url: str, payload: dict, headers: dict) -> requests.Respon
 
 async def get_usernames_from_issue(repo_owner, repo_name, issue_number, token):
     try:
-        headers = {'Authorization': f'token {token}'}
+        headers = _github_headers(token)
         url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/issues/{issue_number}'
         resp = await _http_get(url, headers)
         if resp.status_code != 200:
@@ -621,7 +636,7 @@ async def get_usernames_from_issue(repo_owner, repo_name, issue_number, token):
 
 async def close_github_issue_with_comment(repo_owner, repo_name, issue_number, token, username):
     try:
-        headers = {'Authorization': f'token {token}'}
+        headers = _github_headers(token)
         comment_url = (
             f'https://api.github.com/repos/{repo_owner}/{repo_name}'
             f'/issues/{issue_number}/comments'
@@ -635,15 +650,36 @@ async def close_github_issue_with_comment(repo_owner, repo_name, issue_number, t
         }
         cr = await _http_post(comment_url, payload, headers)
         if cr.status_code not in (200, 201):
-            return False, f"Failed to post comment: {cr.status_code}"
+            logger.error(
+                f"GitHub comment failed — HTTP {cr.status_code} "
+                f"repo={repo_owner}/{repo_name}#{issue_number} "
+                f"body={cr.text[:300]}"
+            )
+            return False, (
+                f"Failed to post comment (HTTP {cr.status_code}). "
+                f"Check token permissions (needs Issues: Read & Write)."
+            )
         issue_url = (
             f'https://api.github.com/repos/{repo_owner}/{repo_name}/issues/{issue_number}'
         )
-        pr = await _http_patch(issue_url, {'state': 'closed'}, headers)
-        ok = pr.status_code == 200
-        return ok, (None if ok else f"Failed to close issue: {pr.status_code}")
+        pr = await _http_patch(
+            issue_url,
+            {'state': 'closed', 'state_reason': 'completed'},
+            headers
+        )
+        if pr.status_code == 200:
+            return True, None
+        logger.error(
+            f"GitHub close failed — HTTP {pr.status_code} "
+            f"repo={repo_owner}/{repo_name}#{issue_number} "
+            f"body={pr.text[:300]}"
+        )
+        return False, (
+            f"Failed to close issue (HTTP {pr.status_code}). "
+            f"Check token permissions (needs Issues: Read & Write)."
+        )
     except Exception as e:
-        return False, f"Error: {e}"
+        return False, f"GitHub API error: {e}"
 
 # ─────────────────────────────────────────────
 # Slash commands
@@ -994,7 +1030,7 @@ async def batchprocess(interaction: discord.Interaction, repo_owner: str, repo_n
     await interaction.response.defer()
 
     try:
-        headers = {'Authorization': f'token {github_token}'}
+        headers = _github_headers(github_token)
         url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/issues?state=open'
         resp = await _http_get(url, headers)
 
