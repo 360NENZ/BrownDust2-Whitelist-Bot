@@ -63,9 +63,10 @@ except Exception as e:
 # Bot setup
 # ─────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True
+intents.guilds   = True
+intents.members  = True
+# message_content intent intentionally omitted --
+# the bot only processes slash commands, never text messages.
 
 bot = commands.Bot(command_prefix='', intents=intents, help_command=None)
 
@@ -190,14 +191,15 @@ def remove_admin(user_id: int):
             con.close()
 
 # ─────────────────────────────────────────────
-# MySQL connectivity check  (reads only — all
-# writes go through the game API)
+# MySQL connectivity check
+# Primary writes  → game API  /Account/Ban
+# Fallback writes → direct MySQL UPDATE
 # ─────────────────────────────────────────────
 def init_db():
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         if conn.is_connected():
-            logger.info("MySQL connection verified (read-only).")
+            logger.info("MySQL connection verified.")
         conn.close()
     except Error as e:
         logger.error(f"MySQL error: {e}")
@@ -206,10 +208,10 @@ def init_db():
 
 
 # ─────────────────────────────────────────────
-# MySQL read helpers  — account table (read-only)
+# MySQL helpers  — account table
 #
-# The game server owns all writes; we only read
-# current state, uid lookups, and login dates.
+# Reads  : uid lookup, current Block, LoginDate
+# Writes : fallback only when the game API fails
 # ─────────────────────────────────────────────
 def _get_account(cursor, identifier: str):
     """
@@ -260,6 +262,45 @@ def query_account(identifier: str):
 
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# MySQL write fallback
+#
+# Used ONLY when the game API is unavailable or
+# returns a non-200 app-level code. The API is
+# always attempted first; _db_set_ban is never
+# called on a successful API response.
+# ─────────────────────────────────────────────
+def _db_set_ban(uid: int, isban: int):
+    """
+    Direct MySQL fallback: UPDATE account SET Block=isban WHERE Uid=uid.
+    Returns (success, error_msg).
+    Caller must have already verified the uid exists via _read_account().
+    """
+    if isban not in (0, 1):
+        return False, f"Invalid isban value '{isban}'."
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur  = conn.cursor()
+        cur.execute(
+            "UPDATE `account` SET `Block` = %s WHERE `Uid` = %s",
+            (isban, uid)
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return False, f"No rows updated for Uid {uid} — account may not exist."
+        logger.warning(
+            f"DB fallback: Block={isban} set for Uid={uid} (game API was unavailable)"
+        )
+        return True, None
+    except Error as e:
+        return False, f"Database fallback error: {e}"
+    except Exception as e:
+        return False, f"Unexpected database fallback error: {e}"
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cur.close(); conn.close()
+
+
 # Game API layer  — GET /Account/Ban
 #
 # This is the ONLY write surface for account state.
@@ -396,9 +437,16 @@ async def _api_set_ban(uid: int, isban: int):
 
 # ─────────────────────────────────────────────
 # High-level account operations
-# All state changes go through _api_set_ban().
-# MySQL is used read-only (uid resolution +
-# current-state duplicate detection).
+#
+# Write strategy (same for all three functions):
+#   1. Read current state from MySQL (_read_account)
+#   2. Duplicate check — bail early if no-op
+#   3. Try game API  (_api_set_ban)           ← primary
+#   4. On API failure → MySQL (_db_set_ban)   ← fallback
+#   5. Both fail → return combined error message
+#
+# Output uid/username prefer API-confirmed values,
+# falling back to MySQL pre-read values otherwise.
 # ─────────────────────────────────────────────
 
 async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
@@ -427,7 +475,19 @@ async def add_to_whitelist(identifier: str, added_by: str, admin: bool = False):
         )
     ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=0)
     if not ok:
-        return False, uid, username, api_err
+        # API failed — attempt direct DB write
+        logger.warning(
+            f"API failed for whitelist uid={uid}: {api_err}. Trying DB fallback."
+        )
+        db_ok, db_err = _db_set_ban(uid, isban=0)
+        if not db_ok:
+            return False, uid, username, (
+                f"API: {api_err} | DB fallback: {db_err}"
+            )
+        logger.info(
+            f"Whitelisted '{username}' (Uid {uid}) via DB fallback by {added_by} [admin={admin}]"
+        )
+        return True, uid, username, None
     out_uid      = api_uid      if api_uid      is not None else uid
     out_username = api_username if api_username is not None else username
     logger.info(f"Whitelisted '{out_username}' (Uid {out_uid}) by {added_by} [admin={admin}]")
@@ -447,7 +507,19 @@ async def ban_user(identifier: str, banned_by: str, reason: str):
         return False, uid, username, block, f"User **{username}** ({uid}) is already banned."
     ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=1)
     if not ok:
-        return False, uid, username, block, api_err
+        # API failed — attempt direct DB write
+        logger.warning(
+            f"API failed for ban uid={uid}: {api_err}. Trying DB fallback."
+        )
+        db_ok, db_err = _db_set_ban(uid, isban=1)
+        if not db_ok:
+            return False, uid, username, block, (
+                f"API: {api_err} | DB fallback: {db_err}"
+            )
+        logger.info(
+            f"Banned '{username}' (Uid {uid}) via DB fallback by {banned_by}. Reason: {reason}"
+        )
+        return True, uid, username, block, None
     out_uid      = api_uid      if api_uid      is not None else uid
     out_username = api_username if api_username is not None else username
     logger.info(f"Banned '{out_username}' (Uid {out_uid}) by {banned_by}. Reason: {reason}")
@@ -470,7 +542,19 @@ async def unban_user(identifier: str):
         )
     ok, api_uid, api_username, _, api_err = await _api_set_ban(uid, isban=0)
     if not ok:
-        return False, uid, username, api_err
+        # API failed — attempt direct DB write
+        logger.warning(
+            f"API failed for unban uid={uid}: {api_err}. Trying DB fallback."
+        )
+        db_ok, db_err = _db_set_ban(uid, isban=0)
+        if not db_ok:
+            return False, uid, username, (
+                f"API: {api_err} | DB fallback: {db_err}"
+            )
+        logger.info(
+            f"Unbanned '{username}' (Uid {uid}) via DB fallback, was Block={block}"
+        )
+        return True, uid, username, None
     out_uid      = api_uid      if api_uid      is not None else uid
     out_username = api_username if api_username is not None else username
     logger.info(f"Unbanned '{out_username}' (Uid {out_uid}), was Block={block}")
@@ -1022,6 +1106,14 @@ async def register_commands():
         setadmin, removeadmin,
     ):
         bot.tree.add_command(cmd)
+
+
+@bot.event
+async def on_message(message):
+    # The bot exclusively uses slash commands (/white, /ban, etc.).
+    # Deliberately do NOT call bot.process_commands() so that no
+    # text message is ever interpreted as a command.
+    pass
 
 
 @bot.event
