@@ -229,6 +229,28 @@ def _load_admins() -> list:
         return []
 
 
+def _yml_str(val) -> str:
+    """
+    Serialize val as a YAML double-quoted scalar string.
+    Handles newlines, tabs, backslashes, and double-quotes safely.
+    Using double-quoted YAML scalars means all standard escape sequences
+    are valid and no special YAML characters can leak out of the value.
+    """
+    s = str(val) if val is not None else ''
+    s = (s
+         .replace('\\', '\\\\')
+         .replace('"',  '\\"')
+         .replace('\n', '\\n')
+         .replace('\r', '\\r')
+         .replace('\t', '\\t'))
+    return f'"{s}"'
+
+
+def _oneline(val) -> str:
+    """Collapse any newlines in val to ' / ' for use inside # comment lines."""
+    return str(val).replace('\r\n', ' / ').replace('\n', ' / ').replace('\r', ' / ')
+
+
 def _save_admins(entries: list):
     """Write admin list to ADMIN_YML with per-entry comment metadata."""
     lines = [
@@ -245,16 +267,19 @@ def _save_admins(entries: list):
         added_by = e.get('added_by', '')
         added_at = e.get('added_at', '')
         note     = e.get('note', '')
-        comment  = f"  # added_at: {added_at}  |  added_by: {added_by}"
+        # Build a single-line comment — _oneline() collapses any embedded
+        # newlines (e.g. from bilingual T() strings) so the comment never
+        # spills onto a second line, which would corrupt the YAML.
+        comment  = f"  # added_at: {_oneline(added_at)}  |  added_by: {_oneline(added_by)}"
         if note:
-            comment += f"  |  note: {note}"
+            comment += f"  |  note: {_oneline(note)}"
         lines.append(comment + "\n")
         lines.append(f"  - id:       {uid}\n")
-        lines.append(f"    username: {uname!r}\n")
-        lines.append(f"    added_by: {added_by!r}\n")
-        lines.append(f"    added_at: {added_at!r}\n")
+        lines.append(f"    username: {_yml_str(uname)}\n")
+        lines.append(f"    added_by: {_yml_str(added_by)}\n")
+        lines.append(f"    added_at: {_yml_str(added_at)}\n")
         if note:
-            lines.append(f"    note:     {note!r}\n")
+            lines.append(f"    note:     {_yml_str(note)}\n")
         lines.append("\n")
     try:
         with open(ADMIN_YML, 'w', encoding='utf-8') as f:

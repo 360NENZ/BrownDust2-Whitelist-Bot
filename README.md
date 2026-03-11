@@ -404,6 +404,9 @@ fix: use Bearer auth scheme for GitHub API; fix collaborator issue access
 feat: YAML config, bilingual output, role config, admin.yml, DB method labels
 ```
 
+```
+fix: corrupt admin.yml when bilingual note contains newline
+```
 ---
 
 ## 🤝 Contributing
