@@ -1,3 +1,6 @@
+config.yml
+admin.yml
+admin.db.migrated
 config.json
 
 # Python gitignore
