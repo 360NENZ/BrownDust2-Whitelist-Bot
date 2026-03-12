@@ -159,19 +159,17 @@ def fmt_block(block: int) -> str:
     return T(f"❓ Unknown ({block})", f"❓ 未知状态（{block}）")
 
 
-def fmt_method(method: str) -> str:
-    """
-    Translate the internal method token into a bilingual display string.
-    method == "API"       →  "via API" / "通过API"
-    method == "DB:<err>"  →  "via database (API failed: <err>)" / "通过数据库（API失败：<err>）"
-    """
+def _fmt_method_en(method: str) -> str:
+    """English-only method label — use in the EN arm of T()."""
     if method == "API":
-        return T("via API", "通过API")
-    api_err = method[3:]   # strip leading "DB:"
-    return T(
-        f"via database (API failed: {api_err})",
-        f"通过数据库（API失败：{api_err}）"
-    )
+        return "via API"
+    return f"via database (API failed: {method[3:]})"
+
+def _fmt_method_zh(method: str) -> str:
+    """Chinese-only method label — use in the ZH arm of T()."""
+    if method == "API":
+        return "通过API"
+    return f"通过数据库（API失败：{method[3:]}）"
 
 
 # ─────────────────────────────────────────────
@@ -826,8 +824,8 @@ async def white(interaction: discord.Interaction, identifier: str):
         )
         if ok:
             await interaction.followup.send(T(
-                f"✅ **{username}** ({uid}) added to whitelist! [{fmt_method(method)}]",
-                f"✅ **{username}**（{uid}）已成功过白！【{fmt_method(method)}】"
+                f"✅ **{username}** ({uid}) added to whitelist! [{_fmt_method_en(method)}]",
+                f"✅ **{username}**（{uid}）已成功过白！【{_fmt_method_zh(method)}】"
             ))
         else:
             await interaction.followup.send(f"❌ {err}")
@@ -880,8 +878,8 @@ async def adduser(interaction: discord.Interaction, identifier: str):
         )
         if ok:
             await interaction.followup.send(T(
-                f"✅ **{username}** ({uid}) added to whitelist! [{fmt_method(method)}]",
-                f"✅ **{username}**（{uid}）已成功过白！【{fmt_method(method)}】"
+                f"✅ **{username}** ({uid}) added to whitelist! [{_fmt_method_en(method)}]",
+                f"✅ **{username}**（{uid}）已成功过白！【{_fmt_method_zh(method)}】"
             ))
         else:
             await interaction.followup.send(f"❌ {err}")
@@ -913,11 +911,11 @@ async def ban(
         )
         if ok:
             await interaction.followup.send(T(
-                f"🚫 **Account Banned** [{fmt_method(method)}]\n"
+                f"🚫 **Account Banned** [{_fmt_method_en(method)}]\n"
                 f"User: `{username}`  UID: `{uid}`\n"
                 f"Before: {fmt_block(old_block)} → After: {fmt_block(1)}",
 
-                f"🚫 **账号已封禁**【{fmt_method(method)}】\n"
+                f"🚫 **账号已封禁**【{_fmt_method_zh(method)}】\n"
                 f"用户：`{username}`  UID：`{uid}`\n"
                 f"变更：{fmt_block(old_block)} → {fmt_block(1)}"
             ))
@@ -942,11 +940,11 @@ async def unban(interaction: discord.Interaction, identifier: str):
         ok, uid, username, method, err = await unban_user(identifier)
         if ok:
             await interaction.followup.send(T(
-                f"✅ **Account Unbanned** [{fmt_method(method)}]\n"
+                f"✅ **Account Unbanned** [{_fmt_method_en(method)}]\n"
                 f"User: `{username}`  UID: `{uid}`\n"
                 f"Status: {fmt_block(0)}",
 
-                f"✅ **账号已解封**【{fmt_method(method)}】\n"
+                f"✅ **账号已解封**【{_fmt_method_zh(method)}】\n"
                 f"用户：`{username}`  UID：`{uid}`\n"
                 f"状态：{fmt_block(0)}"
             ))
@@ -1079,8 +1077,8 @@ async def processissue(
             if ok:
                 added += 1
                 notes.append(T(
-                    f"  ✅ {username} ({uid}) [{fmt_method(method)}]",
-                    f"  ✅ {username}（{uid}）【{fmt_method(method)}】"
+                    f"  ✅ {username} ({uid}) [{_fmt_method_en(method)}]",
+                    f"  ✅ {username}（{uid}）【{_fmt_method_zh(method)}】"
                 ))
             else:
                 skipped += 1

@@ -407,6 +407,10 @@ feat: YAML config, bilingual output, role config, admin.yml, DB method labels
 ```
 fix: corrupt admin.yml when bilingual note contains newline
 ```
+
+```
+fix: bilingual method label duplicated in both language arms
+```
 ---
 
 ## 🤝 Contributing
