@@ -120,6 +120,7 @@ DB_CONFIG  = CONFIG['mysql']
 API_CONFIG = CONFIG['game_api']
 ADMIN_CFG  = CONFIG.get('admin', {})
 ADMIN_YML  = ADMIN_CFG.get('file', 'admin.yml')
+CHANGE_USAGE_YML = 'change_usage.yml'
 LANG       = CONFIG.get('language', 'both')   # 'en' | 'zh' | 'both'
 
 # white_roles: normalise to a set containing strings (names) and ints (IDs)
@@ -393,6 +394,92 @@ def remove_admin(user_id: int, username: str = '') -> tuple:
 
 
 # ─────────────────────────────────────────────
+# /change usage tracking  —  change_usage.yml
+#
+# Regular Discord users may successfully change one account username once.
+# Admins bypass this limit, but successful regular uses are persisted here.
+# ─────────────────────────────────────────────
+def _load_change_usage() -> list:
+    if not os.path.exists(CHANGE_USAGE_YML):
+        return []
+    try:
+        with open(CHANGE_USAGE_YML, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        return data.get('changes', []) or []
+    except Exception as e:
+        logger.error(f"Could not read {CHANGE_USAGE_YML}: {e}")
+        return []
+
+
+def _save_change_usage(entries: list):
+    lines = [
+        f"# /change usage list  —  {CHANGE_USAGE_YML}\n",
+        "# Managed by the bot; safe to edit manually.\n",
+        "# Regular users are limited to one successful /change use by Discord id.\n",
+        "# Fields: id, username, account_uid, old_username, new_username, changed_at\n",
+        "#\n",
+        "changes:\n",
+    ]
+    for e in entries:
+        uid          = e.get('id', '')
+        uname        = e.get('username', '')
+        account_uid  = e.get('account_uid', '')
+        old_username = e.get('old_username', '')
+        new_username = e.get('new_username', '')
+        changed_at   = e.get('changed_at', '')
+        comment = (
+            f"  # changed_at: {_oneline(changed_at)}  |  discord: {_oneline(uname)}"
+            f"  |  account_uid: {_oneline(account_uid)}"
+        )
+        lines.append(comment + "\n")
+        lines.append(f"  - id:           {uid}\n")
+        lines.append(f"    username:     {_yml_str(uname)}\n")
+        lines.append(f"    account_uid:  {account_uid}\n")
+        lines.append(f"    old_username: {_yml_str(old_username)}\n")
+        lines.append(f"    new_username: {_yml_str(new_username)}\n")
+        lines.append(f"    changed_at:   {_yml_str(changed_at)}\n")
+        lines.append("\n")
+    try:
+        with open(CHANGE_USAGE_YML, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        return True, None
+    except Exception as e:
+        logger.error(f"Could not write {CHANGE_USAGE_YML}: {e}")
+        return False, T(
+            f"Could not write {CHANGE_USAGE_YML}: {e}",
+            f"无法写入 {CHANGE_USAGE_YML}：{e}"
+        )
+
+
+def _get_change_usage(user_id: int):
+    for e in _load_change_usage():
+        if str(e.get('id', '')) == str(user_id):
+            return e
+    return None
+
+
+def _mark_change_used(
+    user_id: int,
+    username: str,
+    account_uid: int,
+    old_username: str,
+    new_username: str
+):
+    entries = _load_change_usage()
+    if any(str(e.get('id', '')) == str(user_id) for e in entries):
+        return True, None
+    entries.append({
+        'id':           user_id,
+        'username':     username,
+        'account_uid':  account_uid,
+        'old_username': old_username,
+        'new_username': new_username,
+        'changed_at':   datetime.datetime.now().isoformat(timespec='seconds'),
+    })
+    return _save_change_usage(entries)
+
+
+# ─────────────────────────────────────────────
 # MySQL helpers  — account table
 #
 # Reads  : uid lookup, current Block, LoginDate
@@ -446,6 +533,89 @@ def query_account(identifier: str):
     if err:
         return None, err
     return {"uid": uid, "username": username, "block": block, "login_date": login_date}, None
+
+
+def _is_valid_email(email: str) -> bool:
+    return (
+        len(email) <= 255 and
+        re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) is not None
+    )
+
+
+def _read_account_auth(identifier: str):
+    """
+    Short-lived MySQL read for /change.
+    Returns (uid, username, password, error_msg).
+    """
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur  = conn.cursor()
+        col, val = resolve_identifier(identifier)
+        cur.execute(
+            f"SELECT `Uid`, `UserName`, `Password` "
+            f"FROM `account` WHERE `{col}` = %s LIMIT 1",
+            (val,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None, None, None, T(
+                f"Account [{identifier}] does not exist!",
+                f"账号 [{identifier}] 不存在！"
+            )
+        uid, username, password = row
+        return uid, username, password, None
+    except Error as e:
+        return None, None, None, T(f"Database error: {e}", f"数据库错误：{e}")
+    except Exception as e:
+        return None, None, None, T(f"Unexpected error: {e}", f"意外错误：{e}")
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cur.close(); conn.close()
+
+
+def _username_in_use(username: str, exclude_uid: int):
+    """Returns (in_use, existing_uid, error_msg)."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT `Uid` FROM `account` WHERE `UserName` = %s AND `Uid` <> %s LIMIT 1",
+            (username, exclude_uid)
+        )
+        row = cur.fetchone()
+        if row:
+            return True, row[0], None
+        return False, None, None
+    except Error as e:
+        return False, None, T(f"Database error: {e}", f"数据库错误：{e}")
+    except Exception as e:
+        return False, None, T(f"Unexpected error: {e}", f"意外错误：{e}")
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cur.close(); conn.close()
+
+
+def _db_change_username(uid: int, new_username: str):
+    """Direct MySQL username update. Returns (success, error_msg)."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur  = conn.cursor()
+        cur.execute("UPDATE `account` SET `UserName` = %s WHERE `Uid` = %s", (new_username, uid))
+        conn.commit()
+        if cur.rowcount == 0:
+            return False, T(
+                f"No rows updated for Uid {uid}.",
+                f"Uid {uid} 无更新行，账号可能不存在。"
+            )
+        logger.info(f"DB write: UserName changed for Uid={uid}")
+        return True, None
+    except Error as e:
+        return False, T(f"Database error: {e}", f"数据库错误：{e}")
+    except Exception as e:
+        return False, T(f"Unexpected DB error: {e}", f"意外数据库错误：{e}")
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cur.close(); conn.close()
 
 
 def _db_set_ban(uid: int, isban: int):
@@ -641,6 +811,74 @@ async def unban_user(identifier: str):
     return ok, out_uid, out_uname, method, err
 
 
+def change_account_email(
+    identifier: str,
+    userpass: str,
+    email: str,
+    changed_by_id: int,
+    changed_by_name: str,
+    admin: bool = False
+):
+    """Returns (success, uid, old_username, new_username, error_msg)."""
+    new_username = email.strip()
+    if not _is_valid_email(new_username):
+        return False, None, None, None, T(
+            "Invalid email address. Usage: `/change <uid|username> <password> <email>`",
+            "邮箱格式无效。用法：`/change <uid|用户名> <密码> <邮箱>`"
+        )
+
+    if not admin:
+        used = _get_change_usage(changed_by_id)
+        if used:
+            changed_at = used.get('changed_at', T('unknown time', '未知时间'))
+            return False, None, None, None, T(
+                f"You have already used `/change` once ({changed_at}). Contact an admin if you need another change.",
+                f"你已经使用过一次 `/change`（{changed_at}）。如需再次修改，请联系管理员。"
+            )
+
+    uid, old_username, password, err = _read_account_auth(identifier)
+    if err:
+        return False, None, None, None, err
+
+    if str(password or '') != userpass:
+        return False, uid, old_username, None, T(
+            "Password verification failed. The account was not changed.",
+            "账号密码校验失败，未修改账号。"
+        )
+
+    if str(old_username or '').lower() == new_username.lower():
+        return False, uid, old_username, None, T(
+            f"**{old_username}** ({uid}) already uses this email.",
+            f"**{old_username}**（{uid}）已经是这个邮箱。"
+        )
+
+    in_use, existing_uid, err = _username_in_use(new_username, uid)
+    if err:
+        return False, uid, old_username, None, err
+    if in_use:
+        return False, uid, old_username, None, T(
+            f"The email `{new_username}` is already used by another account (Uid {existing_uid}).",
+            f"邮箱 `{new_username}` 已被其他账号使用（Uid {existing_uid}）。"
+        )
+
+    ok, err = _db_change_username(uid, new_username)
+    if not ok:
+        return False, uid, old_username, None, err
+
+    if not admin:
+        record_ok, record_err = _mark_change_used(
+            changed_by_id, changed_by_name, uid, old_username, new_username
+        )
+        if not record_ok:
+            return False, uid, old_username, new_username, T(
+                f"Username changed, but `/change` usage could not be recorded: {record_err}",
+                f"用户名已修改，但 `/change` 使用记录写入失败：{record_err}"
+            )
+
+    logger.info(f"Changed account username for Uid {uid} by {changed_by_name} admin={admin}")
+    return True, uid, old_username, new_username, None
+
+
 # ─────────────────────────────────────────────
 # GitHub helpers
 # Fine-grained PATs require Bearer scheme; classic PATs accept both.
@@ -759,8 +997,9 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(T(
         """**Discord Whitelist Bot — Commands**
 
-**General** (roles listed in `white_roles` config):
-`/white <uid|username>` — Self-whitelist your game account
+**General:**
+`/white <uid|username>` — Self-whitelist your game account (requires `white_roles`)
+`/change <uid|username> <password> <email>` — Change account username to an email (regular users once; admins unlimited)
 
 **Admin only:**
 `/query <uid|username>` — Look up full account info
@@ -782,8 +1021,9 @@ async def help_cmd(interaction: discord.Interaction):
 
         """**Discord 白名单机器人 — 指令列表**
 
-**普通成员**（需拥有 `white_roles` 配置中的身份组）：
-`/white <uid|用户名>` — 自助申请白名单
+**普通成员：**
+`/white <uid|用户名>` — 自助申请白名单（需要 `white_roles` 身份组）
+`/change <uid|用户名> <密码> <邮箱>` — 将账号用户名改为邮箱（普通用户仅一次，管理员不限）
 
 **仅管理员：**
 `/query <uid|用户名>` — 查询账号详细信息
@@ -832,6 +1072,48 @@ async def white(interaction: discord.Interaction, identifier: str):
     except Exception as e:
         await interaction.followup.send(f"❌ {T(f'Unexpected error: {e}', f'意外错误：{e}')}")
         logger.error(f"/white error: {e}")
+
+
+# ── /change ──────────────────────────────────
+@app_commands.command(name="change", description="Change account username to email / 修改账号用户名为邮箱")
+@app_commands.describe(
+    user="Game Uid or UserName / 游戏UID或用户名",
+    userpass="Account password / 账号密码",
+    email="New email address / 新邮箱"
+)
+async def change(interaction: discord.Interaction, user: str, userpass: str, email: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        admin_user = is_admin(interaction.user.id, interaction.user.name)
+        ok, uid, old_username, new_username, err = change_account_email(
+            user,
+            userpass,
+            email,
+            interaction.user.id,
+            str(interaction.user.name),
+            admin=admin_user
+        )
+        if ok:
+            en_note = "" if admin_user else "\nThis was your one allowed regular-user `/change` use."
+            zh_note = "" if admin_user else "\n这是你唯一一次普通用户 `/change` 使用机会。"
+            await interaction.followup.send(T(
+                f"✅ **Account Username Changed**\n"
+                f"UID: `{uid}`\n"
+                f"Before: `{old_username}`\n"
+                f"After: `{new_username}`"
+                f"{en_note}",
+
+                f"✅ **账号用户名已修改**\n"
+                f"UID：`{uid}`\n"
+                f"修改前：`{old_username}`\n"
+                f"修改后：`{new_username}`"
+                f"{zh_note}"
+            ), ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ {err}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ {T(f'Unexpected error: {e}', f'意外错误：{e}')}", ephemeral=True)
+        logger.error(f"/change error: {e}")
 
 
 # ── /query ───────────────────────────────────
@@ -1234,7 +1516,7 @@ async def removeadmin(interaction: discord.Interaction, user: discord.User):
 # ─────────────────────────────────────────────
 async def register_commands():
     for cmd in (
-        help_cmd, white, query, adduser, ban, unban,
+        help_cmd, white, change, query, adduser, ban, unban,
         whitelisted, banned,
         processissue, batchprocess,
         setadmin, removeadmin,

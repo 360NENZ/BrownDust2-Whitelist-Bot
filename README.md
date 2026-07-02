@@ -1,6 +1,6 @@
 # 🤖 BrownDust2 Whitelist Bot
 
-A Discord bot for managing player whitelist and ban status on a BrownDust private game server. Account state is controlled through the game server's REST API with a direct MySQL write as an automatic fallback. All user-facing messages are available in English, Chinese, or bilingual output. Admin permissions are stored in `admin.yml`.
+A Discord bot for managing player whitelist and ban status on a BrownDust private game server. Whitelist/ban state is controlled through the game server's REST API with a direct MySQL write as an automatic fallback. All user-facing messages are available in English, Chinese, or bilingual output. Admin permissions are stored in `admin.yml`.
 
 ---
 
@@ -8,11 +8,12 @@ A Discord bot for managing player whitelist and ban status on a BrownDust privat
 
 | Feature | Details |
 |---|---|
-| **API-first writes** | All state changes go through `GET /Account/Ban`; direct MySQL write is used automatically if the API fails |
+| **API-first writes** | Whitelist/ban state changes go through `GET /Account/Ban`; direct MySQL write is used automatically if the API fails |
 | **Execution method in responses** | Every success message shows how the operation was executed: `via API` or `via database (API failed: …)` |
 | **Bilingual output** | All Discord responses support English, Chinese, or bilingual mode — set by `language` in config |
 | **YAML config** | `config.yml` is the preferred format; `config.json` is also accepted as a fallback |
 | **Role-based `/white`** | Permitted roles are listed in `white_roles` config (role names or IDs); no hardcoded role logic |
+| **One-time `/change`** | Regular users can change one account username to an email once with the account password; admins are unlimited |
 | **Admin YAML store** | Admin list lives in `admin.yml` with per-entry metadata comments; username lookup takes priority over ID |
 | **admin.db migration** | If `admin.db` exists at startup, records are migrated to `admin.yml` automatically |
 | **GitHub Issues integration** | Reads whitelist requests, whitelists the account, posts a bilingual reply, closes the issue |
@@ -100,7 +101,7 @@ admin:
 
 | Key | Description |
 |---|---|
-| `mysql.*` | Game database credentials (reads + DB fallback writes) |
+| `mysql.*` | Game database credentials (reads + DB fallback writes + `/change` username writes) |
 | `discord.token` | Discord bot token |
 | `github.token` | Fine-grained PAT with Issues: Read & Write |
 | `game_api.base_url` | Base URL of the game server |
@@ -183,9 +184,9 @@ CREATE TABLE `account` (
 
 ---
 
-## ✍️ Write Strategy — API-first with DB fallback
+## ✍️ Whitelist/Ban Write Strategy — API-first with DB fallback
 
-Every account state change follows this path:
+Every whitelist/ban state change follows this path:
 
 ```
 1. Read current state from MySQL (_read_account)
@@ -237,6 +238,7 @@ The bot performs a MySQL connectivity check at startup and exits with an error i
 | Who | Requirement | Can use |
 |---|---|---|
 | **Regular member** | Holds at least one role listed in `white_roles` | `/white` |
+| **Regular member** | Provides the correct account password; one successful use per Discord user | `/change` |
 | **Admin** | Listed in `admin.yml` (by username or ID) | All commands |
 
 ---
@@ -253,6 +255,22 @@ Responds with the execution method:
 ```
 ✅ PlayerOne (10042) added to whitelist! [via API]
 ✅ PlayerOne（10042）已成功过白！【通过API】
+```
+
+---
+
+### `/change <uid\|username> <password> <email>`
+
+Change the matched account's `UserName` to the provided email address.
+
+- Requires the exact account `Password`
+- Regular Discord users may successfully use this command once; repeated use shows a contact-admin hint
+- Admins are not limited by the one-time rule
+- Checks email format and rejects an email already used as another account username
+- Responses are ephemeral
+
+```
+/change PlayerOne currentPassword player@example.com
 ```
 
 ---
@@ -349,6 +367,7 @@ BrownDust2-Whitelist-Bot/
 ├── bot.py                          # Main bot source
 ├── config.yml                      # Runtime config (gitignore this)
 ├── admin.yml                       # Admin list with metadata (gitignore this)
+├── change_usage.yml                # One-time /change usage records (gitignore this)
 ├── admin.db.migrated               # Renamed legacy file (if migration ran)
 ├── .github/
 │   └── ISSUE_TEMPLATE/
@@ -358,7 +377,7 @@ BrownDust2-Whitelist-Bot/
 └── README.md
 ```
 
-> Add `config.yml`, `admin.yml`, and `admin.db*` to `.gitignore`.
+> Add `config.yml`, `admin.yml`, `change_usage.yml`, and `admin.db*` to `.gitignore`.
 
 ---
 
@@ -410,6 +429,10 @@ fix: corrupt admin.yml when bilingual note contains newline
 
 ```
 fix: bilingual method label duplicated in both language arms
+```
+
+```
+feat: add one-time account email change command
 ```
 ---
 
