@@ -397,7 +397,8 @@ def remove_admin(user_id: int, username: str = '') -> tuple:
 # /change usage tracking  —  change_usage.yml
 #
 # Regular Discord users may successfully change one account username once.
-# Admins bypass this limit, but successful regular uses are persisted here.
+# All attempts are counted per Discord user for public audit messages.
+# Admins bypass the successful-use limit.
 # ─────────────────────────────────────────────
 def _load_change_usage() -> list:
     if not os.path.exists(CHANGE_USAGE_YML):
@@ -416,24 +417,29 @@ def _save_change_usage(entries: list):
         f"# /change usage list  —  {CHANGE_USAGE_YML}\n",
         "# Managed by the bot; safe to edit manually.\n",
         "# Regular users are limited to one successful /change use by Discord id.\n",
-        "# Fields: id, username, account_uid, old_username, new_username, changed_at\n",
+        "# Attempts are counted per Discord user.\n",
+        "# Fields: id, username, attempts, last_attempt_at, account_uid, old_username, new_username, changed_at\n",
         "#\n",
         "changes:\n",
     ]
     for e in entries:
         uid          = e.get('id', '')
         uname        = e.get('username', '')
+        attempts     = _change_attempt_count(e)
+        last_attempt = e.get('last_attempt_at', '')
         account_uid  = e.get('account_uid', '')
         old_username = e.get('old_username', '')
         new_username = e.get('new_username', '')
         changed_at   = e.get('changed_at', '')
         comment = (
             f"  # changed_at: {_oneline(changed_at)}  |  discord: {_oneline(uname)}"
-            f"  |  account_uid: {_oneline(account_uid)}"
+            f"  |  attempts: {_oneline(attempts)}  |  account_uid: {_oneline(account_uid)}"
         )
         lines.append(comment + "\n")
         lines.append(f"  - id:           {uid}\n")
         lines.append(f"    username:     {_yml_str(uname)}\n")
+        lines.append(f"    attempts:     {attempts}\n")
+        lines.append(f"    last_attempt_at: {_yml_str(last_attempt)}\n")
         lines.append(f"    account_uid:  {account_uid}\n")
         lines.append(f"    old_username: {_yml_str(old_username)}\n")
         lines.append(f"    new_username: {_yml_str(new_username)}\n")
@@ -458,6 +464,41 @@ def _get_change_usage(user_id: int):
     return None
 
 
+def _change_attempt_count(entry: dict) -> int:
+    try:
+        return int(entry.get('attempts') or (1 if entry.get('changed_at') else 0))
+    except (TypeError, ValueError):
+        return 1 if entry.get('changed_at') else 0
+
+
+def _record_change_attempt(user_id: int, username: str):
+    """Increment and persist this Discord user's /change attempt count."""
+    entries = _load_change_usage()
+    now = datetime.datetime.now().isoformat(timespec='seconds')
+    for e in entries:
+        if str(e.get('id', '')) == str(user_id):
+            attempts = _change_attempt_count(e) + 1
+            e['username'] = username
+            e['attempts'] = attempts
+            e['last_attempt_at'] = now
+            ok, err = _save_change_usage(entries)
+            return ok, attempts, err
+
+    attempts = 1
+    entries.append({
+        'id':              user_id,
+        'username':        username,
+        'attempts':        attempts,
+        'last_attempt_at': now,
+        'account_uid':     '',
+        'old_username':    '',
+        'new_username':    '',
+        'changed_at':      '',
+    })
+    ok, err = _save_change_usage(entries)
+    return ok, attempts, err
+
+
 def _mark_change_used(
     user_id: int,
     username: str,
@@ -466,15 +507,26 @@ def _mark_change_used(
     new_username: str
 ):
     entries = _load_change_usage()
-    if any(str(e.get('id', '')) == str(user_id) for e in entries):
-        return True, None
+    now = datetime.datetime.now().isoformat(timespec='seconds')
+    for e in entries:
+        if str(e.get('id', '')) == str(user_id):
+            e['username'] = username
+            e['account_uid'] = account_uid
+            e['old_username'] = old_username
+            e['new_username'] = new_username
+            if not e.get('changed_at'):
+                e['changed_at'] = now
+            return _save_change_usage(entries)
+
     entries.append({
-        'id':           user_id,
-        'username':     username,
-        'account_uid':  account_uid,
-        'old_username': old_username,
-        'new_username': new_username,
-        'changed_at':   datetime.datetime.now().isoformat(timespec='seconds'),
+        'id':              user_id,
+        'username':        username,
+        'attempts':        1,
+        'last_attempt_at': now,
+        'account_uid':     account_uid,
+        'old_username':    old_username,
+        'new_username':    new_username,
+        'changed_at':      now,
     })
     return _save_change_usage(entries)
 
@@ -813,7 +865,7 @@ async def unban_user(identifier: str):
 
 def change_account_email(
     identifier: str,
-    userpass: str,
+    password: str,
     email: str,
     changed_by_id: int,
     changed_by_name: str,
@@ -829,18 +881,18 @@ def change_account_email(
 
     if not admin:
         used = _get_change_usage(changed_by_id)
-        if used:
+        if used and used.get('changed_at'):
             changed_at = used.get('changed_at', T('unknown time', '未知时间'))
             return False, None, None, None, T(
                 f"You have already used `/change` once ({changed_at}). Contact an admin if you need another change.",
                 f"你已经使用过一次 `/change`（{changed_at}）。如需再次修改，请联系管理员。"
             )
 
-    uid, old_username, password, err = _read_account_auth(identifier)
+    uid, old_username, stored_password, err = _read_account_auth(identifier)
     if err:
         return False, None, None, None, err
 
-    if str(password or '') != userpass:
+    if str(stored_password or '') != password:
         return False, uid, old_username, None, T(
             "Password verification failed. The account was not changed.",
             "账号密码校验失败，未修改账号。"
@@ -1077,17 +1129,25 @@ async def white(interaction: discord.Interaction, identifier: str):
 # ── /change ──────────────────────────────────
 @app_commands.command(name="change", description="Change account username to email / 修改账号用户名为邮箱")
 @app_commands.describe(
-    user="Game Uid or UserName / 游戏UID或用户名",
-    userpass="Account password / 账号密码",
+    identifier="Game Uid or UserName / 游戏UID或用户名",
+    password="Account password / 账号密码",
     email="New email address / 新邮箱"
 )
-async def change(interaction: discord.Interaction, user: str, userpass: str, email: str):
+async def change(interaction: discord.Interaction, identifier: str, password: str, email: str):
     await interaction.response.defer(ephemeral=True)
     try:
         admin_user = is_admin(interaction.user.id, interaction.user.name)
+        attempt_ok, attempts, attempt_err = _record_change_attempt(
+            interaction.user.id,
+            str(interaction.user.name)
+        )
+        if not attempt_ok:
+            await interaction.followup.send(f"❌ {attempt_err}", ephemeral=True)
+            return
+
         ok, uid, old_username, new_username, err = change_account_email(
-            user,
-            userpass,
+            identifier,
+            password,
             email,
             interaction.user.id,
             str(interaction.user.name),
@@ -1109,6 +1169,27 @@ async def change(interaction: discord.Interaction, user: str, userpass: str, ema
                 f"修改后：`{new_username}`"
                 f"{zh_note}"
             ), ephemeral=True)
+            audit_message = T(
+                f"{interaction.user.mention} changed their username to an email.\n"
+                f"Attempts: {attempts}",
+
+                f"{interaction.user.mention}已更改用户名为邮箱。\n"
+                f"尝试次数：{attempts}"
+            )
+            try:
+                if interaction.channel:
+                    await interaction.channel.send(audit_message)
+                else:
+                    await interaction.followup.send(audit_message, ephemeral=False)
+            except Exception as audit_err:
+                logger.error(f"/change audit message error: {audit_err}")
+                await interaction.followup.send(
+                    T(
+                        "⚠️ Username changed, but the public audit message could not be sent.",
+                        "⚠️ 用户名已修改，但公开审计消息发送失败。"
+                    ),
+                    ephemeral=True
+                )
         else:
             await interaction.followup.send(f"❌ {err}", ephemeral=True)
     except Exception as e:

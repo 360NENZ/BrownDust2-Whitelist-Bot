@@ -267,10 +267,19 @@ Change the matched account's `UserName` to the provided email address.
 - Regular Discord users may successfully use this command once; repeated use shows a contact-admin hint
 - Admins are not limited by the one-time rule
 - Checks email format and rejects an email already used as another account username
-- Responses are ephemeral
+- Success/failure details are ephemeral; successful changes also send a public audit message with the user's total attempt count
 
 ```
 /change PlayerOne currentPassword player@example.com
+```
+
+Public audit example:
+```
+@DiscordUser changed their username to an email.
+Attempts: 3
+
+@Discord用户已更改用户名为邮箱。
+尝试次数：3
 ```
 
 ---
@@ -433,6 +442,10 @@ fix: bilingual method label duplicated in both language arms
 
 ```
 feat: add one-time account email change command
+```
+
+```
+feat: add public audit for account email changes
 ```
 ---
 
